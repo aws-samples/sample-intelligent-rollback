@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# CodeBuild buildspec — builds the sample app Docker image and pushes to ECR.
+#
+# Used by CodePipeline to automate the build step before CodeDeploy.
+# Environment variables are set by CodePipeline/CodeBuild project config.
+#
+# Required environment variables:
+#   AWS_ACCOUNT_ID     — AWS account ID
+#   AWS_DEFAULT_REGION — Target region
+#   IMAGE_REPO_NAME    — ECR repository name
+#   IMAGE_TAG          — Docker image tag (default: latest)
+# ---------------------------------------------------------------------------
+version: 0.2
+
+env:
+  variables:
+    IMAGE_TAG: "latest"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=$IMAGE_TAG}
+      - echo "Repository URI = $REPOSITORY_URI"
+      - echo "Image tag = $IMAGE_TAG"
+
+  build:
+    commands:
+      - echo "Building Docker image..."
+      - cd sample-app
+      - docker build -t $REPOSITORY_URI:$IMAGE_TAG .
+      - docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:latest
+
+  post_build:
+    commands:
+      - echo "Pushing Docker image to ECR..."
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:latest
+      - echo "Generating image definitions file..."
+      # Output the image URI for CodeDeploy to use in the task definition
+      - printf '{"ImageURI":"%s"}' $REPOSITORY_URI:$IMAGE_TAG > imageDetail.json
+      # Generate taskdef with the new image URI
+      - |
+        sed -e "s|<IMAGE_URI>|${REPOSITORY_URI}:${IMAGE_TAG}|g" \
+            -e "s|<EXEC_ROLE_ARN>|${EXEC_ROLE_ARN}|g" \
+            -e "s|<TASK_ROLE_ARN>|${TASK_ROLE_ARN}|g" \
+            -e "s|<AWS_REGION>|${AWS_DEFAULT_REGION}|g" \
+            ../deploy/taskdef.json > taskdef.json
+      - echo "Build complete."
+
+artifacts:
+  files:
+    - imageDetail.json
+    - taskdef.json
+    - deploy/appspec.yaml
+  discard-paths: no
+
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'

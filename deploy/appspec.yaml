@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# CodeDeploy AppSpec for ECS Blue/Green Deployment
+#
+# This file tells CodeDeploy how to shift traffic from the current (blue)
+# target group to the new (green) target group during a deployment.
+#
+# The <TASK_DEFINITION> placeholder is replaced at deployment time by
+# CodePipeline or the deploy script with the actual task definition ARN.
+# ---------------------------------------------------------------------------
+version: 0.0
+
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        # TaskDefinition ARN — replaced by CI/CD pipeline
+        TaskDefinition: <TASK_DEFINITION>
+        # Load balancer configuration for traffic shifting
+        LoadBalancerInfo:
+          ContainerName: "sample-app"
+          ContainerPort: 8080
+        # Optional: Platform version for Fargate
+        PlatformVersion: "LATEST"
+        # Network configuration matches the ECS service
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            Subnets:
+              - "subnet-placeholder-1"
+              - "subnet-placeholder-2"
+            SecurityGroups:
+              - "sg-placeholder"
+            AssignPublicIp: "DISABLED"
+
+# Optional lifecycle hooks for validation during deployment
+Hooks:
+  - BeforeAllowTraffic: "CodeDeployHook_BeforeTraffic"
+  - AfterAllowTraffic: "CodeDeployHook_AfterTraffic"

@@ -1,0 +1,3 @@
+# boto3 is included in the Lambda runtime but listed here for local development
+boto3>=1.34.0
+botocore>=1.34.0
