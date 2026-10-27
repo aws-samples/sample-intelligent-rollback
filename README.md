@@ -15,8 +15,8 @@ See [architecture/architecture.md](architecture/architecture.md) for a detailed 
 2. Amazon CloudWatch alarm detects anomalous error rate or latency
 3. Alarm invokes the Webhook Forwarder Lambda
 4. Webhook Forwarder signs the payload with HMAC-SHA256 and posts the event to the AWS DevOps Agent webhook endpoint
-5. AWS DevOps Agent evaluates the situation and invokes the MCP Rollback Tool
-6. MCP Rollback Tool calls AWS CodeDeploy `StopDeployment` with auto-rollback enabled
+5. AWS DevOps Agent evaluates the situation with the decision runbook in `devops-agent/` and invokes the MCP Rollback Tool
+6. To roll back, the MCP Rollback Tool calls AWS CodeDeploy `StopDeployment` with auto-rollback enabled; to hold or escalate, it calls the `notify` action instead
 7. Amazon SNS notification sent to operators with action details and audit trail
 
 ## Prerequisites
@@ -35,11 +35,19 @@ See [architecture/architecture.md](architecture/architecture.md) for a detailed 
 ├── README.md
 ├── LICENSE
 ├── CONTRIBUTING.md
+├── CODE_OF_CONDUCT.md
+├── SECURITY.md
 ├── .gitignore
 ├── architecture/
-│   └── architecture.md          # Architecture diagram and description
+│   ├── architecture.md          # Architecture diagram and description
+│   └── architecture.png
+├── devops-agent/
+│   ├── README.md
+│   ├── mcp-tool-definition.json        # MCP tool schema for the rollback tool
+│   ├── deployment-metadata-schema.json # JSON Schema of the webhook payload
+│   └── rollback-decision-runbook.md    # Four-dimension decision framework
 ├── mcp-rollback-tool/
-│   ├── lambda_function.py       # MCP tool Lambda — rollback, stop, status, list
+│   ├── lambda_function.py       # MCP tool Lambda — rollback, stop, status, list, notify
 │   └── requirements.txt
 ├── webhook-forwarder/
 │   ├── lambda_function.py       # CloudWatch alarm → DevOps Agent webhook forwarder
@@ -51,9 +59,15 @@ See [architecture/architecture.md](architecture/architecture.md) for a detailed 
 └── deploy/
     ├── deploy.sh                # Full infrastructure deployment
     ├── cleanup.sh               # Teardown all resources
+    ├── cloudwatch-alarm.json    # Error-rate alarm definition (5% for 3 minutes)
+    ├── iam/                     # Least-privilege Lambda roles and policies
+    │   ├── lambda-trust-policy.json
+    │   ├── mcp-rollback-tool-policy.json
+    │   └── webhook-forwarder-policy.json
     ├── taskdef.json             # Amazon ECS task definition template
     ├── appspec.yaml             # AWS CodeDeploy ECS blue/green appspec
     └── buildspec.yml            # AWS CodeBuild buildspec for CI/CD
+└── tests/                       # Unit and contract tests (boto3 mocked)
 ```
 
 ## Deployment
@@ -62,14 +76,14 @@ See [architecture/architecture.md](architecture/architecture.md) for a detailed 
 
 ```bash
 # Clone the repository
-git clone https://github.com/aws-samples/intelligent-rollback-devops-agent.git
-cd intelligent-rollback-devops-agent
+git clone https://github.com/aws-samples/sample-intelligent-rollback.git
+cd sample-intelligent-rollback
 
 # Configure environment variables
 export AWS_REGION=us-east-1
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export DEVOPS_AGENT_WEBHOOK_URL="https://your-devops-agent-webhook-url"
-export WEBHOOK_SECRET="your-hmac-secret"
+export WEBHOOK_SECRET="your-hmac-secret"   # stored as an SSM SecureString by deploy.sh
 export NOTIFICATION_EMAIL="your-email@example.com"
 
 # Deploy all infrastructure
@@ -83,7 +97,7 @@ chmod +x deploy/deploy.sh
 2. **Deploy the Amazon ECS service** with AWS CodeDeploy blue/green
 3. **Deploy the MCP Rollback Tool Lambda** and register with the AWS DevOps Agent
 4. **Deploy the Webhook Forwarder Lambda** with Amazon CloudWatch alarm trigger
-5. **Configure the AWS DevOps Agent** with the MCP tool endpoint and webhook
+5. **Configure the AWS DevOps Agent** with the MCP tool endpoint and webhook, using the files in [devops-agent/](devops-agent/README.md)
 
 See [deploy/deploy.sh](deploy/deploy.sh) for complete commands.
 
@@ -100,7 +114,7 @@ aws ecs update-service \
   --service sample-app-service \
   --task-definition sample-app-bad
 
-# The Amazon CloudWatch alarm will fire within 1-2 minutes,
+# The Amazon CloudWatch alarm will fire within about 3 minutes,
 # triggering the AWS DevOps Agent to evaluate and roll back
 ```
 
@@ -110,14 +124,36 @@ aws ecs update-service \
 # Check deployment status
 aws lambda invoke \
   --function-name mcp-rollback-tool \
+  --cli-binary-format raw-in-base64-out \
   --payload '{"action": "status", "deployment_group": "sample-app-dg"}' \
   response.json
 
 # List recent deployments
 aws lambda invoke \
   --function-name mcp-rollback-tool \
+  --cli-binary-format raw-in-base64-out \
   --payload '{"action": "list", "application_name": "sample-app"}' \
   response.json
+
+# Publish a hold decision to Amazon SNS (no change to the deployment)
+aws lambda invoke \
+  --function-name mcp-rollback-tool \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"action": "notify", "decision": "hold", "reason": "Manual test"}' \
+  response.json
+```
+
+The input contract for every action is in
+[devops-agent/mcp-tool-definition.json](devops-agent/mcp-tool-definition.json).
+
+### Running the Unit Tests
+
+The tests mock boto3 and make no AWS calls.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r tests/requirements-dev.txt
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## Configuration
@@ -125,11 +161,13 @@ aws lambda invoke \
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | `AWS_REGION` | AWS Region for deployment | `us-east-1` |
-| `CODEDEPLOY_APP_NAME` | AWS CodeDeploy application name | `sample-app` |
-| `CODEDEPLOY_DG_NAME` | AWS CodeDeploy deployment group name | `sample-app-dg` |
-| `SNS_TOPIC_ARN` | Amazon SNS topic for notifications | (required) |
-| `WEBHOOK_URL` | AWS DevOps Agent webhook endpoint | (required) |
-| `WEBHOOK_SECRET` | HMAC secret for webhook signing | (required) |
+| `CONFIG_PARAMETER_NAME` | MCP tool: Parameter Store parameter with `application_name`, `deployment_group`, `sns_topic_arn` (JSON) | `/intelligent-rollback/config` (set by deploy.sh) |
+| `CODEDEPLOY_APP_NAME` | AWS CodeDeploy application name (fallback for the MCP tool) | `sample-app` |
+| `CODEDEPLOY_DG_NAME` | AWS CodeDeploy deployment group name (fallback for the MCP tool) | `sample-app-dg` |
+| `SNS_TOPIC_ARN` | Amazon SNS topic for notifications (fallback for the MCP tool) | (required) |
+| `WEBHOOK_URL` | AWS DevOps Agent webhook endpoint (https only) | (required) |
+| `WEBHOOK_SECRET_PARAMETER` | Webhook Forwarder: SSM SecureString parameter holding the HMAC secret | `/intelligent-rollback/webhook-secret` (set by deploy.sh) |
+| `WEBHOOK_SECRET` | HMAC secret, local testing only; ignored when `WEBHOOK_SECRET_PARAMETER` is set | (none) |
 | `ERROR_RATE` | Sample app error rate (0.0-1.0) | `0.0` |
 | `LATENCY_MS` | Sample app added latency (ms) | `0` |
 
@@ -149,16 +187,22 @@ This is a demonstration sample. Before using it as a basis for production, note:
 - **TLS termination:** The Application Load Balancer serves plain HTTP on port 80
   for demo simplicity. Production deployments should add an HTTPS listener with an
   AWS Certificate Manager (ACM) certificate and terminate TLS at the ALB.
-- **Least-privilege IAM:** AWS CodeDeploy actions (`StopDeployment`, `GetDeployment`,
-  `BatchGetDeployments`, `ListDeployments`) are scoped to this sample's application
-  and deployment group ARNs. `cloudwatch:PutMetricData` does not support
-  resource-level permissions and is constrained by a `cloudwatch:namespace` condition.
+- **Least-privilege IAM:** Each Lambda function has its own role with the policy
+  documents in [deploy/iam/](deploy/iam/). AWS CodeDeploy actions are scoped to this
+  sample's application and deployment group ARNs, and only the MCP Rollback Tool can
+  call `StopDeployment` or `sns:Publish`. `cloudwatch:PutMetricData` (ECS task role)
+  does not support resource-level permissions and is constrained by a
+  `cloudwatch:namespace` condition.
 - **Webhook authentication:** Webhook payloads are signed with HMAC-SHA256 using a
-  shared secret (`WEBHOOK_SECRET`). For production, store the secret in AWS Secrets
-  Manager rather than plain environment variables and rotate it regularly.
-- **Amazon SNS notifications:** Both the MCP Rollback Tool and the Webhook Forwarder
-  publish operator notifications to Amazon SNS after each action, providing an audit
-  trail for the operations team.
+  shared secret. `deploy.sh` stores the secret as an AWS Systems Manager Parameter
+  Store SecureString, and the Webhook Forwarder reads it at runtime; the secret is
+  never placed in a Lambda environment variable or logged. Rotate it regularly.
+- **Invocation:** Neither Lambda function has a function URL. The Webhook Forwarder
+  accepts invocations only from this sample's CloudWatch alarm in this account, and
+  the MCP Rollback Tool is invoked through IAM (`lambda:InvokeFunction`) only.
+- **Amazon SNS notifications:** The MCP Rollback Tool publishes operator
+  notifications to Amazon SNS after each rollback, stop, or `notify` (hold or
+  escalate) call, providing an audit trail for the operations team.
 
 To report a security issue, see [SECURITY.md](SECURITY.md). See
 [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.

@@ -18,6 +18,8 @@ Environment Variables:
     CLOUDWATCH_NAMESPACE — Custom metric namespace (default: IntelligentRollback)
     SERVICE_NAME       — Service identifier for metrics (default: sample-app)
     PORT               — Listen port (default: 8080)
+    HOST               — Local dev server bind address (default: 127.0.0.1;
+                         the container uses gunicorn, see Dockerfile)
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ LATENCY_MS = int(os.environ.get("LATENCY_MS", "0"))
 CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "IntelligentRollback")
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "sample-app")
 PORT = int(os.environ.get("PORT", "8080"))
+HOST = os.environ.get("HOST", "127.0.0.1")
 
 # Logging setup
 logging.basicConfig(
@@ -226,4 +229,4 @@ if __name__ == "__main__":
         LATENCY_MS,
     )
     # In production, Gunicorn runs the app; this is for local dev only
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False)

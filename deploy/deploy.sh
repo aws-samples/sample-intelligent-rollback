@@ -13,6 +13,17 @@
 #   8. SNS topic for notifications
 #   9. CloudWatch alarm
 #
+# Configuration files used:
+#   deploy/taskdef.json                     ECS task definition template
+#   deploy/iam/lambda-trust-policy.json     Lambda execution role trust policy
+#   deploy/iam/mcp-rollback-tool-policy.json  Least-privilege MCP tool policy
+#   deploy/iam/webhook-forwarder-policy.json  Least-privilege forwarder policy
+#   deploy/cloudwatch-alarm.json            Error-rate alarm definition
+#
+# SSM Parameter Store parameters written:
+#   /intelligent-rollback/config            MCP tool config (String, JSON)
+#   /intelligent-rollback/webhook-secret    HMAC secret (SecureString)
+#
 # Prerequisites:
 #   - AWS CLI v2 configured with admin-level credentials
 #   - Docker running locally
@@ -221,56 +232,38 @@ CODEDEPLOY_ROLE_ARN=$(aws iam create-role \
 aws iam attach-role-policy --role-name "${PROJECT_NAME}-codedeploy-role" \
     --policy-arn arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
 
-# Lambda Execution Role
-cat > /tmp/lambda-trust-policy.json << 'EOF'
-{
-    "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Principal": {"Service": "lambda.amazonaws.com"},
-        "Action": "sts:AssumeRole"
-    }]
+# Lambda execution roles: one per function, each with its own
+# least-privilege inline policy from deploy/iam/. All CodeDeploy actions used
+# (StopDeployment, GetDeployment, BatchGetDeployments, ListDeployments)
+# support resource-level permissions and are scoped to this sample's
+# application and deployment group.
+render_template() {
+    # Usage: render_template <template> <output>
+    sed -e "s|<AWS_REGION>|${AWS_REGION}|g" \
+        -e "s|<AWS_ACCOUNT_ID>|${AWS_ACCOUNT_ID}|g" \
+        -e "s|<CODEDEPLOY_APP_NAME>|${CODEDEPLOY_APP_NAME}|g" \
+        -e "s|<CODEDEPLOY_DG_NAME>|${CODEDEPLOY_DG_NAME}|g" \
+        -e "s|<SNS_TOPIC_NAME>|${SNS_TOPIC_NAME}|g" \
+        -e "s|<PROJECT_NAME>|${PROJECT_NAME}|g" \
+        "$1" > "$2"
 }
-EOF
 
-LAMBDA_ROLE_ARN=$(aws iam create-role \
-    --role-name "${PROJECT_NAME}-lambda-role" \
-    --assume-role-policy-document file:///tmp/lambda-trust-policy.json \
-    --query 'Role.Arn' --output text 2>/dev/null || \
-    aws iam get-role --role-name "${PROJECT_NAME}-lambda-role" --query 'Role.Arn' --output text)
+for FUNCTION_NAME in mcp-rollback-tool webhook-forwarder; do
+    ROLE_NAME="${PROJECT_NAME}-${FUNCTION_NAME}-role"
+    aws iam create-role \
+        --role-name "$ROLE_NAME" \
+        --assume-role-policy-document file://deploy/iam/lambda-trust-policy.json \
+        > /dev/null 2>&1 || true
+    render_template "deploy/iam/${FUNCTION_NAME}-policy.json" "/tmp/${FUNCTION_NAME}-policy-rendered.json"
+    aws iam put-role-policy --role-name "$ROLE_NAME" \
+        --policy-name "${FUNCTION_NAME}-least-privilege" \
+        --policy-document "file:///tmp/${FUNCTION_NAME}-policy-rendered.json"
+done
 
-aws iam attach-role-policy --role-name "${PROJECT_NAME}-lambda-role" \
-    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-# Note: all CodeDeploy actions used here (StopDeployment, GetDeployment,
-# BatchGetDeployments, ListDeployments) support resource-level permissions and
-# are scoped to this sample's application and deployment group.
-aws iam put-role-policy --role-name "${PROJECT_NAME}-lambda-role" \
-    --policy-name codedeploy-and-sns \
-    --policy-document "{
-        \"Version\": \"2012-10-17\",
-        \"Statement\": [
-            {
-                \"Sid\": \"CodeDeployDeploymentGroupScoped\",
-                \"Effect\": \"Allow\",
-                \"Action\": [
-                    \"codedeploy:StopDeployment\",
-                    \"codedeploy:GetDeployment\",
-                    \"codedeploy:BatchGetDeployments\",
-                    \"codedeploy:ListDeployments\"
-                ],
-                \"Resource\": [
-                    \"arn:aws:codedeploy:${AWS_REGION}:${AWS_ACCOUNT_ID}:deploymentgroup:${CODEDEPLOY_APP_NAME}/${CODEDEPLOY_DG_NAME}\",
-                    \"arn:aws:codedeploy:${AWS_REGION}:${AWS_ACCOUNT_ID}:application:${CODEDEPLOY_APP_NAME}\"
-                ]
-            },
-            {
-                \"Effect\": \"Allow\",
-                \"Action\": \"sns:Publish\",
-                \"Resource\": \"arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}\"
-            }
-        ]
-    }"
+MCP_ROLE_ARN=$(aws iam get-role --role-name "${PROJECT_NAME}-mcp-rollback-tool-role" \
+    --query 'Role.Arn' --output text)
+FORWARDER_ROLE_ARN=$(aws iam get-role --role-name "${PROJECT_NAME}-webhook-forwarder-role" \
+    --query 'Role.Arn' --output text)
 
 # Wait for IAM propagation
 echo "  Waiting for IAM role propagation..."
@@ -432,6 +425,37 @@ fi
 
 echo "  SNS Topic: $SNS_TOPIC_ARN"
 
+# Tool configuration in Parameter Store (read by the MCP Rollback Tool)
+CONFIG_PARAMETER_NAME="/${PROJECT_NAME}/config"
+WEBHOOK_SECRET_PARAMETER="/${PROJECT_NAME}/webhook-secret"
+
+aws ssm put-parameter \
+    --name "$CONFIG_PARAMETER_NAME" \
+    --type String \
+    --overwrite \
+    --value "{\"application_name\":\"${CODEDEPLOY_APP_NAME}\",\"deployment_group\":\"${CODEDEPLOY_DG_NAME}\",\"sns_topic_arn\":\"${SNS_TOPIC_ARN}\"}" \
+    > /dev/null
+
+# Webhook HMAC secret as a SecureString (AWS managed aws/ssm key). The value
+# goes through a private temp file so it never appears on a command line.
+SECRET_INPUT_FILE=$(umask 077 && mktemp /tmp/webhook-secret-XXXXXX)
+WEBHOOK_SECRET="$WEBHOOK_SECRET" WEBHOOK_SECRET_PARAMETER="$WEBHOOK_SECRET_PARAMETER" python3 -c '
+import json, os, sys
+json.dump(
+    {
+        "Name": os.environ["WEBHOOK_SECRET_PARAMETER"],
+        "Type": "SecureString",
+        "Overwrite": True,
+        "Value": os.environ["WEBHOOK_SECRET"],
+    },
+    sys.stdout,
+)' > "$SECRET_INPUT_FILE"
+aws ssm put-parameter --cli-input-json "file://${SECRET_INPUT_FILE}" > /dev/null
+rm -f "$SECRET_INPUT_FILE"
+unset WEBHOOK_SECRET
+
+echo "  Parameters: $CONFIG_PARAMETER_NAME, $WEBHOOK_SECRET_PARAMETER"
+
 # ---------------------------------------------------------------------------
 # Step 8: Lambda Functions
 # ---------------------------------------------------------------------------
@@ -439,43 +463,51 @@ echo "  SNS Topic: $SNS_TOPIC_ARN"
 echo ""
 echo "[8/9] Deploying Lambda functions..."
 
+# create_or_update_function <name> <role-arn> <zip> <environment>
+# Creates the function, or on reruns updates its code, role and environment.
+# Neither function gets a function URL or a public resource policy: the
+# MCP tool is invoked through IAM only (lambda:InvokeFunction).
+create_or_update_function() {
+    local name="$1" role_arn="$2" zip_file="$3" environment="$4"
+    if aws lambda get-function --function-name "$name" > /dev/null 2>&1; then
+        aws lambda update-function-code \
+            --function-name "$name" \
+            --zip-file "fileb://${zip_file}" > /dev/null
+        aws lambda wait function-updated --function-name "$name"
+        aws lambda update-function-configuration \
+            --function-name "$name" \
+            --role "$role_arn" \
+            --environment "$environment" > /dev/null
+    else
+        aws lambda create-function \
+            --function-name "$name" \
+            --runtime python3.12 \
+            --handler lambda_function.lambda_handler \
+            --role "$role_arn" \
+            --zip-file "fileb://${zip_file}" \
+            --timeout 30 \
+            --memory-size 256 \
+            --environment "$environment" > /dev/null
+    fi
+    aws lambda wait function-active-v2 --function-name "$name"
+}
+
 # Package and deploy MCP Rollback Tool
 cd mcp-rollback-tool
 zip -r /tmp/mcp-rollback-tool.zip lambda_function.py
 cd ..
 
-aws lambda create-function \
-    --function-name "mcp-rollback-tool" \
-    --runtime python3.12 \
-    --handler lambda_function.lambda_handler \
-    --role "$LAMBDA_ROLE_ARN" \
-    --zip-file fileb:///tmp/mcp-rollback-tool.zip \
-    --timeout 30 \
-    --memory-size 256 \
-    --environment "Variables={CODEDEPLOY_APP_NAME=${CODEDEPLOY_APP_NAME},CODEDEPLOY_DG_NAME=${CODEDEPLOY_DG_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}" \
-    2>/dev/null || \
-aws lambda update-function-code \
-    --function-name "mcp-rollback-tool" \
-    --zip-file fileb:///tmp/mcp-rollback-tool.zip
+create_or_update_function "mcp-rollback-tool" "$MCP_ROLE_ARN" /tmp/mcp-rollback-tool.zip \
+    "Variables={CONFIG_PARAMETER_NAME=${CONFIG_PARAMETER_NAME},CODEDEPLOY_APP_NAME=${CODEDEPLOY_APP_NAME},CODEDEPLOY_DG_NAME=${CODEDEPLOY_DG_NAME},SNS_TOPIC_ARN=${SNS_TOPIC_ARN}}"
 
-# Package and deploy Webhook Forwarder
+# Package and deploy Webhook Forwarder (reads its HMAC secret from
+# Parameter Store at runtime; the secret is not stored in the environment)
 cd webhook-forwarder
 zip -r /tmp/webhook-forwarder.zip lambda_function.py
 cd ..
 
-aws lambda create-function \
-    --function-name "webhook-forwarder" \
-    --runtime python3.12 \
-    --handler lambda_function.lambda_handler \
-    --role "$LAMBDA_ROLE_ARN" \
-    --zip-file fileb:///tmp/webhook-forwarder.zip \
-    --timeout 30 \
-    --memory-size 256 \
-    --environment "Variables={WEBHOOK_URL=${DEVOPS_AGENT_WEBHOOK_URL},WEBHOOK_SECRET=${WEBHOOK_SECRET},CODEDEPLOY_APP_NAME=${CODEDEPLOY_APP_NAME},CODEDEPLOY_DG_NAME=${CODEDEPLOY_DG_NAME}}" \
-    2>/dev/null || \
-aws lambda update-function-code \
-    --function-name "webhook-forwarder" \
-    --zip-file fileb:///tmp/webhook-forwarder.zip
+create_or_update_function "webhook-forwarder" "$FORWARDER_ROLE_ARN" /tmp/webhook-forwarder.zip \
+    "Variables={WEBHOOK_URL=${DEVOPS_AGENT_WEBHOOK_URL},WEBHOOK_SECRET_PARAMETER=${WEBHOOK_SECRET_PARAMETER},CODEDEPLOY_APP_NAME=${CODEDEPLOY_APP_NAME},CODEDEPLOY_DG_NAME=${CODEDEPLOY_DG_NAME}}"
 
 echo "  Lambda functions deployed"
 
@@ -497,25 +529,20 @@ aws lambda add-permission \
     --action "lambda:InvokeFunction" \
     --principal "lambda.alarms.cloudwatch.amazonaws.com" \
     --source-arn "arn:aws:cloudwatch:${AWS_REGION}:${AWS_ACCOUNT_ID}:alarm:${ALARM_NAME}" \
+    --source-account "$AWS_ACCOUNT_ID" \
     2>/dev/null || true
 
-# Create a math expression alarm: ErrorCount / RequestCount > 0.05
-aws cloudwatch put-metric-alarm \
-    --alarm-name "$ALARM_NAME" \
-    --alarm-description "Triggers when sample-app error rate exceeds 5% over 1 minute" \
-    --metrics '[
-        {"Id":"errors","MetricStat":{"Metric":{"Namespace":"IntelligentRollback","MetricName":"ErrorCount","Dimensions":[{"Name":"ServiceName","Value":"sample-app"}]},"Period":60,"Stat":"Sum"},"ReturnData":false},
-        {"Id":"requests","MetricStat":{"Metric":{"Namespace":"IntelligentRollback","MetricName":"RequestCount","Dimensions":[{"Name":"ServiceName","Value":"sample-app"}]},"Period":60,"Stat":"Sum"},"ReturnData":false},
-        {"Id":"error_rate","Expression":"IF(requests>0, errors/requests, 0)","Label":"ErrorRate","ReturnData":true}
-    ]' \
-    --threshold 0.05 \
-    --comparison-operator GreaterThanThreshold \
-    --evaluation-periods 1 \
-    --datapoints-to-alarm 1 \
-    --treat-missing-data notBreaching \
-    --alarm-actions "$FORWARDER_ARN"
+# Render the alarm from deploy/cloudwatch-alarm.json:
+# 100 * ErrorCount / RequestCount > 5.0 for 3 consecutive 60-second periods
+sed -e "s|<ALARM_NAME>|${ALARM_NAME}|g" \
+    -e "s|<FORWARDER_ARN>|${FORWARDER_ARN}|g" \
+    -e "s|<CLOUDWATCH_NAMESPACE>|IntelligentRollback|g" \
+    -e "s|<SERVICE_NAME>|sample-app|g" \
+    deploy/cloudwatch-alarm.json > /tmp/cloudwatch-alarm-rendered.json
 
-echo "  CloudWatch alarm: $ALARM_NAME (threshold: 5% error rate)"
+aws cloudwatch put-metric-alarm --cli-input-json file:///tmp/cloudwatch-alarm-rendered.json
+
+echo "  CloudWatch alarm: $ALARM_NAME (threshold: 5% error rate for 3 minutes)"
 
 # ---------------------------------------------------------------------------
 # Summary

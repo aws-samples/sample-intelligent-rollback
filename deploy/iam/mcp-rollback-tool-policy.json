@@ -1,0 +1,46 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "CodeDeployScoped",
+            "Effect": "Allow",
+            "Action": [
+                "codedeploy:StopDeployment",
+                "codedeploy:GetDeployment",
+                "codedeploy:BatchGetDeployments",
+                "codedeploy:ListDeployments"
+            ],
+            "Resource": [
+                "arn:aws:codedeploy:<AWS_REGION>:<AWS_ACCOUNT_ID>:deploymentgroup:<CODEDEPLOY_APP_NAME>/<CODEDEPLOY_DG_NAME>",
+                "arn:aws:codedeploy:<AWS_REGION>:<AWS_ACCOUNT_ID>:application:<CODEDEPLOY_APP_NAME>"
+            ]
+        },
+        {
+            "Sid": "SnsPublishTopic",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:<AWS_REGION>:<AWS_ACCOUNT_ID>:<SNS_TOPIC_NAME>"
+        },
+        {
+            "Sid": "ReadConfigParameter",
+            "Effect": "Allow",
+            "Action": "ssm:GetParameter",
+            "Resource": "arn:aws:ssm:<AWS_REGION>:<AWS_ACCOUNT_ID>:parameter/<PROJECT_NAME>/config"
+        },
+        {
+            "Sid": "CreateOwnLogGroup",
+            "Effect": "Allow",
+            "Action": "logs:CreateLogGroup",
+            "Resource": "arn:aws:logs:<AWS_REGION>:<AWS_ACCOUNT_ID>:log-group:/aws/lambda/mcp-rollback-tool:*"
+        },
+        {
+            "Sid": "WriteOwnLogs",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:<AWS_REGION>:<AWS_ACCOUNT_ID>:log-group:/aws/lambda/mcp-rollback-tool:log-stream:*"
+        }
+    ]
+}

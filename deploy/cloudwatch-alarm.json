@@ -1,0 +1,58 @@
+{
+    "AlarmName": "<ALARM_NAME>",
+    "AlarmDescription": "Sample app 5xx error rate above 5 percent for 3 consecutive minutes",
+    "ActionsEnabled": true,
+    "AlarmActions": [
+        "<FORWARDER_ARN>"
+    ],
+    "Metrics": [
+        {
+            "Id": "errors",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "<CLOUDWATCH_NAMESPACE>",
+                    "MetricName": "ErrorCount",
+                    "Dimensions": [
+                        {
+                            "Name": "ServiceName",
+                            "Value": "<SERVICE_NAME>"
+                        }
+                    ]
+                },
+                "Period": 60,
+                "Stat": "Sum"
+            },
+            "ReturnData": false
+        },
+        {
+            "Id": "requests",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "<CLOUDWATCH_NAMESPACE>",
+                    "MetricName": "RequestCount",
+                    "Dimensions": [
+                        {
+                            "Name": "ServiceName",
+                            "Value": "<SERVICE_NAME>"
+                        }
+                    ]
+                },
+                "Period": 60,
+                "Stat": "Sum"
+            },
+            "ReturnData": false
+        },
+        {
+            "Id": "error_rate",
+            "Expression": "IF(requests > 0, 100 * errors / requests, 0)",
+            "Label": "ErrorRatePercent",
+            "Period": 60,
+            "ReturnData": true
+        }
+    ],
+    "EvaluationPeriods": 3,
+    "DatapointsToAlarm": 3,
+    "Threshold": 5.0,
+    "ComparisonOperator": "GreaterThanThreshold",
+    "TreatMissingData": "notBreaching"
+}

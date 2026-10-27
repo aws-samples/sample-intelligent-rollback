@@ -43,9 +43,12 @@ aws lambda delete-function --function-name "mcp-rollback-tool" 2>/dev/null || tr
 aws lambda delete-function --function-name "webhook-forwarder" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Step 3: SNS Topic
+# Step 3: SNS Topic and SSM Parameters
 # ---------------------------------------------------------------------------
-echo "[3/9] Deleting SNS topic..."
+echo "[3/9] Deleting SNS topic and Parameter Store parameters..."
+aws ssm delete-parameters \
+    --names "/${PROJECT_NAME}/config" "/${PROJECT_NAME}/webhook-secret" \
+    > /dev/null 2>&1 || true
 SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${PROJECT_NAME}-notifications"
 # Remove all subscriptions first
 for SUB_ARN in $(aws sns list-subscriptions-by-topic --topic-arn "$SNS_TOPIC_ARN" \
@@ -184,7 +187,9 @@ fi
 echo "[9/9] Deleting IAM roles..."
 
 for ROLE_NAME in "${PROJECT_NAME}-ecs-execution-role" "${PROJECT_NAME}-ecs-task-role" \
-    "${PROJECT_NAME}-codedeploy-role" "${PROJECT_NAME}-lambda-role"; do
+    "${PROJECT_NAME}-codedeploy-role" "${PROJECT_NAME}-mcp-rollback-tool-role" \
+    "${PROJECT_NAME}-webhook-forwarder-role" "${PROJECT_NAME}-lambda-role"; do
+    # ${PROJECT_NAME}-lambda-role is the shared role used by older versions
     # Detach managed policies
     for POLICY in $(aws iam list-attached-role-policies --role-name "$ROLE_NAME" \
         --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
