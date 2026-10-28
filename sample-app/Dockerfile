@@ -7,8 +7,13 @@
 # Security: Runs as non-root user, minimal attack surface, no dev tools.
 # ---------------------------------------------------------------------------
 
-# Stage 1: Builder — install Python dependencies
-FROM python:3.12-slim AS builder
+# Base image pinned by digest so every build uses the same image. To refresh
+# it, pull the tag and copy the new digest into both FROM lines:
+#   docker pull python:3.12-slim
+#   docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
+
+# Stage 1: Builder, install Python dependencies
+FROM python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f AS builder
 
 WORKDIR /build
 
@@ -17,7 +22,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # Stage 2: Production image
-FROM python:3.12-slim AS production
+FROM python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f AS production
 
 # Security: Create non-root user before copying application files
 RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
@@ -39,6 +44,7 @@ USER appuser
 # Environment defaults (overridden by ECS task definition)
 ENV PORT=8080 \
     ERROR_RATE=0.0 \
+    DEPENDENCY_FAILURE_RATE=0.0 \
     LATENCY_MS=0 \
     SERVICE_NAME=sample-app \
     CLOUDWATCH_NAMESPACE=IntelligentRollback \

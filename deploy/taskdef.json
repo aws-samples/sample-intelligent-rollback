@@ -43,6 +43,10 @@
                     "value": "1.0.0"
                 },
                 {
+                    "name": "DEPENDENCY_FAILURE_PARAMETER",
+                    "value": "/intelligent-rollback/dependency-failure-rate"
+                },
+                {
                     "name": "AWS_REGION",
                     "value": "<AWS_REGION>"
                 }
@@ -52,8 +56,7 @@
                 "options": {
                     "awslogs-group": "/ecs/sample-app",
                     "awslogs-region": "<AWS_REGION>",
-                    "awslogs-stream-prefix": "ecs",
-                    "awslogs-create-group": "true"
+                    "awslogs-stream-prefix": "ecs"
                 }
             },
             "healthCheck": {

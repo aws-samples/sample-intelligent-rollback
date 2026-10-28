@@ -21,10 +21,16 @@
             "Resource": "arn:aws:ssm:<AWS_REGION>:<AWS_ACCOUNT_ID>:parameter/<PROJECT_NAME>/webhook-secret"
         },
         {
-            "Sid": "CreateOwnLogGroup",
+            "Sid": "PublishInvestigatingNotice",
             "Effect": "Allow",
-            "Action": "logs:CreateLogGroup",
-            "Resource": "arn:aws:logs:<AWS_REGION>:<AWS_ACCOUNT_ID>:log-group:/aws/lambda/webhook-forwarder:*"
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:<AWS_REGION>:<AWS_ACCOUNT_ID>:<SNS_TOPIC_NAME>"
+        },
+        {
+            "Sid": "SendToDeadLetterQueue",
+            "Effect": "Allow",
+            "Action": "sqs:SendMessage",
+            "Resource": "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:<DLQ_NAME>"
         },
         {
             "Sid": "WriteOwnLogs",

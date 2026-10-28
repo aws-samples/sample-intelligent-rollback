@@ -2,277 +2,58 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://github.com/aws-samples/sample-intelligent-rollback/devops-agent/deployment-metadata-schema.json",
     "title": "Intelligent Rollback webhook payload",
-    "description": "JSON body the webhook-forwarder Lambda function POSTs to the AWS DevOps Agent webhook. It is serialized compactly and sent with these headers: Content-Type: application/json; X-Hub-Signature-256: sha256=<hex HMAC-SHA256 of the exact body bytes, keyed with the shared secret>; X-Webhook-Source: aws-intelligent-rollback; X-Webhook-Timestamp: <Unix epoch seconds>. Only ALARM state changes are forwarded.",
+    "description": "Incident envelope the webhook-forwarder Lambda function POSTs to the AWS DevOps Agent generic webhook (HMAC, version 1). The body is serialized compactly as UTF-8 JSON and sent with exactly three headers: Content-Type: application/json; x-amzn-event-timestamp: <UTC time as %Y-%m-%dT%H:%M:%S.mmmZ>; x-amzn-event-signature: base64(HMAC-SHA256(secret, <timestamp> + ':' + <body bytes>)), keyed with the signing secret the Agent Space webhook generated. Only title, description, priority, and the incident reference reach the agent, so all evidence is in the fixed-order 'Key: value' lines of description. Only ALARM state changes are forwarded. See https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-invoking-devops-agent-through-webhook.html",
     "type": "object",
     "additionalProperties": false,
     "required": [
-        "version",
-        "source",
-        "event_type",
+        "eventType",
+        "incidentId",
+        "action",
+        "priority",
+        "title",
+        "description",
         "timestamp",
-        "alert",
-        "metric",
-        "deployment",
-        "context",
-        "recommended_actions"
+        "service"
     ],
     "properties": {
-        "version": {
-            "const": "1.0"
+        "eventType": {
+            "const": "incident"
         },
-        "source": {
-            "const": "aws-cloudwatch-alarm"
+        "incidentId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9-]{1,128}$",
+            "description": "Deterministic per alarm transition: sanitized alarm name (at most 80 characters) plus the compact UTC state timestamp, so a retried event is deduplicated and a new transition is not."
         },
-        "event_type": {
-            "const": "deployment_health_alert"
+        "action": {
+            "const": "created"
+        },
+        "priority": {
+            "enum": [
+                "HIGH",
+                "MEDIUM"
+            ],
+            "description": "HIGH when a deployment is in flight or the deployment lookup failed; MEDIUM when no deployment is in flight."
+        },
+        "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+        },
+        "description": {
+            "type": "string",
+            "maxLength": 4000,
+            "pattern": "(^|\\n)Deployment ID: ",
+            "description": "Fixed-order lines: Alarm, Alarm ARN, State, State changed at, Alarm reason (from CloudWatch), Metric, Metric expression, Threshold, Recent datapoints, Evaluation period, Deployment in flight, Deployment ID, Deployment status, Deployment created at, Deployment completed at, Application / deployment group, Account / Region, Deployment description (untrusted). The alarm reason and deployment description are untrusted text: control characters are replaced, whitespace is collapsed, and each is truncated to 500 characters."
         },
         "timestamp": {
-            "type": "integer",
-            "description": "When the forwarder built the payload, Unix epoch seconds."
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3})?Z$",
+            "description": "When the alarm entered ALARM, ISO 8601 UTC."
         },
-        "alert": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "name",
-                "arn",
-                "state",
-                "previous_state",
-                "reason",
-                "state_timestamp",
-                "threshold",
-                "recent_datapoints",
-                "severity"
-            ],
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "CloudWatch alarm name."
-                },
-                "arn": {
-                    "type": [
-                        "string",
-                        "null"
-                    ],
-                    "description": "Alarm ARN (null for EventBridge-delivered events)."
-                },
-                "state": {
-                    "const": "ALARM"
-                },
-                "previous_state": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "CloudWatch state change reason."
-                },
-                "state_timestamp": {
-                    "type": [
-                        "string",
-                        "null"
-                    ],
-                    "description": "When the alarm entered ALARM, as reported by CloudWatch. Compare with deployment.create_time for temporal correlation."
-                },
-                "threshold": {
-                    "type": [
-                        "number",
-                        "null"
-                    ]
-                },
-                "recent_datapoints": {
-                    "type": "array",
-                    "items": {
-                        "type": "number"
-                    },
-                    "description": "Most recent evaluated datapoints from the alarm reasonData (can be empty)."
-                },
-                "severity": {
-                    "const": "critical"
-                }
-            }
-        },
-        "metric": {
-            "description": "Metric behind the alarm, or an empty object when the alarm event carries no metric configuration.",
-            "anyOf": [
-                {
-                    "type": "object",
-                    "maxProperties": 0
-                },
-                {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "namespace",
-                        "metric_name",
-                        "dimensions",
-                        "period",
-                        "stat",
-                        "expression"
-                    ],
-                    "properties": {
-                        "namespace": {
-                            "type": "string"
-                        },
-                        "metric_name": {
-                            "type": "string",
-                            "description": "First source metric (for metric math alarms, the first metric with a MetricStat)."
-                        },
-                        "dimensions": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        },
-                        "period": {
-                            "type": "integer"
-                        },
-                        "stat": {
-                            "type": "string"
-                        },
-                        "expression": {
-                            "type": [
-                                "string",
-                                "null"
-                            ],
-                            "description": "Metric math expression the alarm evaluates, or null for single-metric alarms."
-                        }
-                    }
-                }
-            ]
-        },
-        "deployment": {
-            "description": "Active CodeDeploy deployment for the configured deployment group, looked up when the alarm fired. Concurrent alarms that share deployment_id are signals about the same deployment.",
-            "oneOf": [
-                {
-                    "title": "Active deployment",
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "active_deployment",
-                        "deployment_id",
-                        "status",
-                        "application_name",
-                        "deployment_group",
-                        "create_time",
-                        "complete_time",
-                        "description"
-                    ],
-                    "properties": {
-                        "active_deployment": {
-                            "const": true
-                        },
-                        "deployment_id": {
-                            "type": "string",
-                            "pattern": "^d-[A-Z0-9]{9}$"
-                        },
-                        "status": {
-                            "type": "string",
-                            "enum": [
-                                "Created",
-                                "Queued",
-                                "InProgress",
-                                "Baking",
-                                "Ready"
-                            ]
-                        },
-                        "application_name": {
-                            "type": "string"
-                        },
-                        "deployment_group": {
-                            "type": "string"
-                        },
-                        "create_time": {
-                            "type": "string",
-                            "description": "Deployment start, ISO 8601."
-                        },
-                        "complete_time": {
-                            "type": "string",
-                            "description": "Deployment end, ISO 8601, or empty while in flight."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "CodeDeploy deployment description. Put changed code paths or commit details here from your CI/CD pipeline."
-                        }
-                    }
-                },
-                {
-                    "title": "No active deployment",
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "active_deployment",
-                        "application_name",
-                        "deployment_group"
-                    ],
-                    "properties": {
-                        "active_deployment": {
-                            "const": false
-                        },
-                        "application_name": {
-                            "type": "string"
-                        },
-                        "deployment_group": {
-                            "type": "string"
-                        }
-                    }
-                },
-                {
-                    "title": "Lookup failed",
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": [
-                        "active_deployment",
-                        "application_name",
-                        "deployment_group",
-                        "error"
-                    ],
-                    "properties": {
-                        "active_deployment": {
-                            "const": null
-                        },
-                        "application_name": {
-                            "type": "string"
-                        },
-                        "deployment_group": {
-                            "type": "string"
-                        },
-                        "error": {
-                            "type": "string",
-                            "description": "AWS error code from the CodeDeploy lookup."
-                        }
-                    }
-                }
-            ]
-        },
-        "context": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-                "account_id",
-                "region",
-                "source_event_id"
-            ],
-            "properties": {
-                "account_id": {
-                    "type": "string"
-                },
-                "region": {
-                    "type": "string"
-                },
-                "source_event_id": {
-                    "type": "string",
-                    "description": "EventBridge event ID, or empty for direct alarm actions."
-                }
-            }
-        },
-        "recommended_actions": {
-            "type": "array",
-            "items": {
-                "type": "string"
-            }
+        "service": {
+            "type": "string",
+            "minLength": 1,
+            "description": "CodeDeploy application name."
         }
     }
 }

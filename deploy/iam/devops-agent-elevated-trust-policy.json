@@ -1,0 +1,25 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "DevOpsAgentElevatedAssumeRole",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "aidevops.amazonaws.com"
+            },
+            "Action": [
+                "sts:AssumeRole",
+                "sts:SetSourceIdentity",
+                "sts:TagSession"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:SourceAccount": "<AWS_ACCOUNT_ID>"
+                },
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:aidevops:<DEVOPS_AGENT_REGION>:<AWS_ACCOUNT_ID>:agentspace/*"
+                }
+            }
+        }
+    ]
+}

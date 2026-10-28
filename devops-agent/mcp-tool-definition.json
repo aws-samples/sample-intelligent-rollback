@@ -1,219 +1,903 @@
 {
-    "name": "intelligent_rollback",
-    "title": "Intelligent Rollback (AWS CodeDeploy)",
-    "description": "Manage the AWS CodeDeploy blue/green deployment for the configured application and deployment group. Actions: rollback (StopDeployment with autoRollbackEnabled=true, reverts traffic to the previous task set), stop (StopDeployment without rollback, only when a human operator asks), status (describe one deployment or the newest one), list (recent deployments, newest first), notify (publish a hold or escalate decision and its reasoning to Amazon SNS without changing the deployment). Always pass a reason that summarizes the evidence. Backed by the mcp-rollback-tool AWS Lambda function, which returns {\"statusCode\": <int>, \"body\": \"<JSON string>\"}; outputSchema describes the parsed body. statusCode 200 = success, 400 = validation error (fix the input, do not retry), 503 = transient error (retry after a short wait), 500 = permanent error (escalate to a human).",
-    "inputSchema": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Sample-specific descriptor for this repository, not an AWS DevOps Agent API request. Only toolDetails[].name and toolDetails[].toolClassification mirror documented API field names (see the directed-actions page). tools[] is exactly what the server returns from tools/list.",
+  "description": "MCP server for the intelligent rollback sample. AWS DevOps Agent calls it over MCP Streamable HTTP at the API Gateway endpoint below, signed with AWS SigV4. The two READ_ONLY tools run during an investigation; the three MUTATIVE tools run only as directed actions that an operator approves in chat.",
+  "endpoint": {
+    "transport": "Streamable HTTP (JSON responses, stateless)",
+    "path": "/mcp",
+    "auth": "AWS SigV4, service execute-api"
+  },
+  "tools": [
+    {
+      "name": "get_deployment_status",
+      "title": "Get CodeDeploy deployment status",
+      "description": "Read-only. Describe one AWS CodeDeploy deployment of the configured deployment group, or the newest one if deployment_id is omitted: status, create and complete times, description, rollback info, error information, and the traffic-shift overview. Safe to call during an investigation.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "deployment_id": {
+            "type": "string",
+            "minLength": 11,
+            "maxLength": 11,
+            "pattern": "^d-[A-Z0-9]{9}$",
+            "description": "Optional CodeDeploy deployment ID, for example the Deployment ID line of the incident description. Must belong to the configured deployment group. If omitted, the newest deployment is described."
+          },
+          "application_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
+          },
+          "deployment_group": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
+          }
+        }
+      },
+      "outputSchema": {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "action"
+          "success",
+          "action",
+          "message",
+          "details",
+          "timestamp"
         ],
         "properties": {
-            "action": {
+          "success": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "description": "The action that was handled: status, list, rollback, stop, or notify."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable summary."
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
+            "properties": {
+              "deployment_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": "string"
+              },
+              "application_name": {
+                "type": "string"
+              },
+              "deployment_group": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "decision": {
                 "type": "string",
                 "enum": [
-                    "list",
-                    "notify",
-                    "rollback",
-                    "status",
-                    "stop"
-                ],
-                "description": "Operation to perform."
-            },
-            "application_name": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 100,
-                "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
-                "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
-            },
-            "deployment_group": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 100,
-                "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
-                "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
-            },
-            "deployment_id": {
-                "type": "string",
-                "minLength": 11,
-                "maxLength": 11,
-                "pattern": "^d-[A-Z0-9]{9}$",
-                "description": "Optional CodeDeploy deployment ID, for example the deployment.deployment_id from the webhook payload. Must belong to the configured deployment group; rollback and stop also require it to be active. If omitted, rollback, stop and notify use the newest active deployment and status uses the newest deployment."
-            },
-            "reason": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 1000,
-                "pattern": "\\S",
-                "description": "Why the action is being taken. Included in the SNS notification. Required for notify."
-            },
-            "decision": {
-                "type": "string",
-                "enum": [
-                    "hold",
-                    "escalate"
-                ],
-                "description": "notify only, required: hold = deployment is not the likely cause, keep monitoring; escalate = evidence is ambiguous, a human should decide."
-            },
-            "max_results": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 25,
-                "default": 10,
-                "description": "list only: number of deployments to return."
-            }
-        },
-        "allOf": [
-            {
-                "if": {
-                    "properties": {
-                        "action": {
-                            "const": "notify"
-                        }
-                    },
-                    "required": [
-                        "action"
-                    ]
-                },
-                "then": {
-                    "required": [
-                        "reason",
-                        "decision"
-                    ]
-                }
-            }
-        ]
-    },
-    "outputSchema": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "success",
-            "action",
-            "message",
-            "details",
-            "timestamp"
-        ],
-        "properties": {
-            "success": {
+                  "hold",
+                  "escalate"
+                ]
+              },
+              "notification_published": {
                 "type": "boolean"
-            },
-            "action": {
-                "type": "string",
-                "description": "The action that was handled, or the rejected/missing action name."
-            },
-            "message": {
-                "type": "string",
-                "description": "Human-readable summary."
-            },
-            "timestamp": {
-                "type": "integer",
-                "description": "Unix epoch seconds."
-            },
-            "details": {
-                "type": "object",
-                "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
-                "properties": {
+              },
+              "has_deployments": {
+                "type": "boolean"
+              },
+              "create_time": {
+                "type": "string"
+              },
+              "complete_time": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "rollback_info": {
+                "type": "object"
+              },
+              "error_information": {
+                "type": "object"
+              },
+              "deployment_overview": {
+                "type": "object"
+              },
+              "deployments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
                     "deployment_id": {
-                        "type": [
-                            "string",
-                            "null"
-                        ]
+                      "type": "string"
                     },
                     "status": {
-                        "type": "string"
-                    },
-                    "status_message": {
-                        "type": "string"
-                    },
-                    "application_name": {
-                        "type": "string"
-                    },
-                    "deployment_group": {
-                        "type": "string"
-                    },
-                    "reason": {
-                        "type": "string"
-                    },
-                    "decision": {
-                        "type": "string",
-                        "enum": [
-                            "hold",
-                            "escalate"
-                        ]
-                    },
-                    "notification_published": {
-                        "type": "boolean"
-                    },
-                    "has_deployments": {
-                        "type": "boolean"
+                      "type": "string"
                     },
                     "create_time": {
-                        "type": "string"
+                      "type": "string"
                     },
                     "complete_time": {
-                        "type": "string"
+                      "type": "string"
                     },
                     "description": {
-                        "type": "string"
-                    },
-                    "creator": {
-                        "type": "string"
-                    },
-                    "rollback_info": {
-                        "type": "object"
-                    },
-                    "error_information": {
-                        "type": "object"
-                    },
-                    "deployment_overview": {
-                        "type": "object"
-                    },
-                    "deployments": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "deployment_id": {
-                                    "type": "string"
-                                },
-                                "status": {
-                                    "type": "string"
-                                },
-                                "create_time": {
-                                    "type": "string"
-                                },
-                                "complete_time": {
-                                    "type": "string"
-                                },
-                                "description": {
-                                    "type": "string"
-                                }
-                            }
-                        }
-                    },
-                    "total_count": {
-                        "type": "integer"
-                    },
-                    "error_code": {
-                        "type": "string"
-                    },
-                    "error_type": {
-                        "type": "string",
-                        "enum": [
-                            "validation",
-                            "transient",
-                            "permanent"
-                        ]
-                    },
-                    "retryable": {
-                        "type": "boolean"
+                      "type": "string"
                     }
+                  }
                 }
+              },
+              "total_count": {
+                "type": "integer"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": [
+                  "validation",
+                  "transient",
+                  "permanent"
+                ]
+              },
+              "retryable": {
+                "type": "boolean"
+              }
             }
+          }
         }
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "list_deployments",
+      "title": "List recent CodeDeploy deployments",
+      "description": "Read-only. List recent AWS CodeDeploy deployments of the configured deployment group (created in the last 30 days), newest first, with status, times, and description. Use it to spot repeated failures. Safe to call during an investigation.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "default": 10,
+            "description": "Number of deployments to return."
+          },
+          "application_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
+          },
+          "deployment_group": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "action",
+          "message",
+          "details",
+          "timestamp"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "description": "The action that was handled: status, list, rollback, stop, or notify."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable summary."
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
+            "properties": {
+              "deployment_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": "string"
+              },
+              "application_name": {
+                "type": "string"
+              },
+              "deployment_group": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "hold",
+                  "escalate"
+                ]
+              },
+              "notification_published": {
+                "type": "boolean"
+              },
+              "has_deployments": {
+                "type": "boolean"
+              },
+              "create_time": {
+                "type": "string"
+              },
+              "complete_time": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "rollback_info": {
+                "type": "object"
+              },
+              "error_information": {
+                "type": "object"
+              },
+              "deployment_overview": {
+                "type": "object"
+              },
+              "deployments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "deployment_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "create_time": {
+                      "type": "string"
+                    },
+                    "complete_time": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "total_count": {
+                "type": "integer"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": [
+                  "validation",
+                  "transient",
+                  "permanent"
+                ]
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "rollback_deployment",
+      "title": "Roll back a CodeDeploy deployment",
+      "description": "Stop an active AWS CodeDeploy deployment with autoRollbackEnabled=true, which reroutes traffic to the previous task set. The deployment must belong to the configured deployment group and still be active. This tool changes state and requires operator approval. Do not call it during an autonomous investigation; recommend it instead and call it only when an operator asks for it in chat.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deployment_id",
+          "reason"
+        ],
+        "properties": {
+          "deployment_id": {
+            "type": "string",
+            "minLength": 11,
+            "maxLength": 11,
+            "pattern": "^d-[A-Z0-9]{9}$",
+            "description": "CodeDeploy deployment ID to roll back. Must belong to the configured deployment group and be active."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "pattern": "\\S",
+            "description": "Evidence that supports the rollback. Included in the SNS notification."
+          },
+          "application_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
+          },
+          "deployment_group": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "action",
+          "message",
+          "details",
+          "timestamp"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "description": "The action that was handled: status, list, rollback, stop, or notify."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable summary."
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
+            "properties": {
+              "deployment_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": "string"
+              },
+              "application_name": {
+                "type": "string"
+              },
+              "deployment_group": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "hold",
+                  "escalate"
+                ]
+              },
+              "notification_published": {
+                "type": "boolean"
+              },
+              "has_deployments": {
+                "type": "boolean"
+              },
+              "create_time": {
+                "type": "string"
+              },
+              "complete_time": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "rollback_info": {
+                "type": "object"
+              },
+              "error_information": {
+                "type": "object"
+              },
+              "deployment_overview": {
+                "type": "object"
+              },
+              "deployments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "deployment_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "create_time": {
+                      "type": "string"
+                    },
+                    "complete_time": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "total_count": {
+                "type": "integer"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": [
+                  "validation",
+                  "transient",
+                  "permanent"
+                ]
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "stop_deployment",
+      "title": "Stop a CodeDeploy deployment without rollback",
+      "description": "Stop an active AWS CodeDeploy deployment without rollback, keeping the new task set in place. Use only when an operator asks to halt the deployment. This tool changes state and requires operator approval. Do not call it during an autonomous investigation; recommend it instead and call it only when an operator asks for it in chat.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deployment_id",
+          "reason"
+        ],
+        "properties": {
+          "deployment_id": {
+            "type": "string",
+            "minLength": 11,
+            "maxLength": 11,
+            "pattern": "^d-[A-Z0-9]{9}$",
+            "description": "CodeDeploy deployment ID to stop. Must belong to the configured deployment group and be active."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "pattern": "\\S",
+            "description": "Why the deployment is being stopped."
+          },
+          "application_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
+          },
+          "deployment_group": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "action",
+          "message",
+          "details",
+          "timestamp"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "description": "The action that was handled: status, list, rollback, stop, or notify."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable summary."
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
+            "properties": {
+              "deployment_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": "string"
+              },
+              "application_name": {
+                "type": "string"
+              },
+              "deployment_group": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "hold",
+                  "escalate"
+                ]
+              },
+              "notification_published": {
+                "type": "boolean"
+              },
+              "has_deployments": {
+                "type": "boolean"
+              },
+              "create_time": {
+                "type": "string"
+              },
+              "complete_time": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "rollback_info": {
+                "type": "object"
+              },
+              "error_information": {
+                "type": "object"
+              },
+              "deployment_overview": {
+                "type": "object"
+              },
+              "deployments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "deployment_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "create_time": {
+                      "type": "string"
+                    },
+                    "complete_time": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "total_count": {
+                "type": "integer"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": [
+                  "validation",
+                  "transient",
+                  "permanent"
+                ]
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "notify_operators",
+      "title": "Notify operators of a hold or escalate decision",
+      "description": "Publish a hold or escalate decision and its reasoning to the operators' Amazon SNS topic. Does not change the deployment. hold means the deployment is not the likely cause; escalate means the evidence is ambiguous and a human should decide. This tool changes state and requires operator approval. Do not call it during an autonomous investigation; recommend it instead and call it only when an operator asks for it in chat.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "decision",
+          "reason"
+        ],
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "hold",
+              "escalate"
+            ],
+            "description": "hold or escalate."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "pattern": "\\S",
+            "description": "Evidence behind the decision. Included in the SNS notification."
+          },
+          "deployment_id": {
+            "type": "string",
+            "minLength": 11,
+            "maxLength": 11,
+            "pattern": "^d-[A-Z0-9]{9}$",
+            "description": "Optional CodeDeploy deployment ID. Must belong to the configured deployment group. If omitted, the newest active deployment is used."
+          },
+          "application_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy application this tool is configured for; any other value is rejected."
+          },
+          "deployment_group": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._+=,@-]{1,100}$",
+            "description": "Optional. Must equal the CodeDeploy deployment group this tool is configured for; any other value is rejected."
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "success",
+          "action",
+          "message",
+          "details",
+          "timestamp"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "description": "The action that was handled: status, list, rollback, stop, or notify."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable summary."
+          },
+          "timestamp": {
+            "type": "integer",
+            "description": "Unix epoch seconds."
+          },
+          "details": {
+            "type": "object",
+            "description": "Action-specific fields. Error responses always include error_code, error_type and retryable.",
+            "properties": {
+              "deployment_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string"
+              },
+              "status_message": {
+                "type": "string"
+              },
+              "application_name": {
+                "type": "string"
+              },
+              "deployment_group": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "hold",
+                  "escalate"
+                ]
+              },
+              "notification_published": {
+                "type": "boolean"
+              },
+              "has_deployments": {
+                "type": "boolean"
+              },
+              "create_time": {
+                "type": "string"
+              },
+              "complete_time": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "rollback_info": {
+                "type": "object"
+              },
+              "error_information": {
+                "type": "object"
+              },
+              "deployment_overview": {
+                "type": "object"
+              },
+              "deployments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "deployment_id": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "create_time": {
+                      "type": "string"
+                    },
+                    "complete_time": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "total_count": {
+                "type": "integer"
+              },
+              "error_code": {
+                "type": "string"
+              },
+              "error_type": {
+                "type": "string",
+                "enum": [
+                  "validation",
+                  "transient",
+                  "permanent"
+                ]
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
     }
+  ],
+  "toolDetails": [
+    {
+      "name": "get_deployment_status",
+      "toolClassification": "READ_ONLY"
+    },
+    {
+      "name": "list_deployments",
+      "toolClassification": "READ_ONLY"
+    },
+    {
+      "name": "rollback_deployment",
+      "toolClassification": "MUTATIVE"
+    },
+    {
+      "name": "stop_deployment",
+      "toolClassification": "MUTATIVE"
+    },
+    {
+      "name": "notify_operators",
+      "toolClassification": "MUTATIVE"
+    }
+  ]
 }

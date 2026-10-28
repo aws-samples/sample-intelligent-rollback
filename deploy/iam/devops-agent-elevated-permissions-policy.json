@@ -1,0 +1,11 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "StopSampleDeploymentOnly",
+            "Effect": "Allow",
+            "Action": "codedeploy:StopDeployment",
+            "Resource": "arn:aws:codedeploy:<AWS_REGION>:<AWS_ACCOUNT_ID>:deploymentgroup:sample-app/sample-app-dg"
+        }
+    ]
+}

@@ -1,34 +1,46 @@
 """
-MCP Rollback Tool — AWS Lambda function for the AWS DevOps Agent.
+MCP Rollback Tool: AWS Lambda function behind an MCP server for AWS DevOps Agent.
 
-This Lambda implements a Model Context Protocol (MCP) tool that the AWS DevOps
-Agent can invoke to manage CodeDeploy deployments. It supports five actions:
+AWS DevOps Agent reaches this function through an MCP endpoint: an Amazon API
+Gateway REST API (POST /mcp, AWS_IAM authorization, SigV4 with service
+execute-api) with a Lambda proxy integration. mcp_server.py implements the
+stateless MCP Streamable HTTP layer and maps five tools to actions here:
 
-    rollback  Stop the deployment with autoRollbackEnabled=True
-    stop      Stop the deployment without rollback (operator request only)
-    status    Describe one deployment, or the newest one for the group
-    list      List recent deployments for the group
-    notify    Publish the agent's hold or escalate reasoning to SNS without
-              changing the deployment
+    get_deployment_status  status    Describe one deployment, or the newest
+                                     one for the group (read-only)
+    list_deployments       list      List recent deployments for the group
+                                     (read-only)
+    rollback_deployment    rollback  Stop the deployment with
+                                     autoRollbackEnabled=True
+    stop_deployment        stop      Stop the deployment without rollback
+    notify_operators       notify    Publish a hold or escalate decision to
+                                     SNS without changing the deployment
 
-Every input is validated before any CodeDeploy call: the deployment ID format,
-that the deployment belongs to the configured application and deployment
-group, and (for rollback/stop) that the deployment is still active. Errors are
-returned as validation (400), transient (503, retryable) or permanent (500).
+Approval model: the two read-only tools are classified READ_ONLY and the agent
+may call them during an investigation. The other three are classified
+MUTATIVE: the agent recommends them, and they run only when an operator asks
+for the action in chat and approves it (a directed action).
 
-The input contract is described by devops-agent/mcp-tool-definition.json.
+Every input is validated before any CodeDeploy call: required fields, the
+deployment ID format, that the deployment belongs to the configured
+application and deployment group, and (for rollback and stop) that the
+deployment is still active. Errors are returned as validation (400), transient
+(503, retryable) or permanent (500).
 
-Architecture:
-    AWS DevOps Agent → Lambda (this) → CodeDeploy API → SNS notification
+The tool contract is described by devops-agent/mcp-tool-definition.json.
+
+Flow:
+    AWS DevOps Agent, then API Gateway (SigV4), then this function, then the
+    CodeDeploy API, then an SNS notification
 
 Environment Variables:
-    CONFIG_PARAMETER_NAME — SSM Parameter Store parameter holding a JSON object
-                            with application_name, deployment_group and
-                            sns_topic_arn (recommended)
-    CODEDEPLOY_APP_NAME   — Fallback CodeDeploy application name
-    CODEDEPLOY_DG_NAME    — Fallback CodeDeploy deployment group name
-    SNS_TOPIC_ARN         — Fallback SNS topic for operator notifications
-    AWS_REGION            — AWS region (set automatically by Lambda)
+    CONFIG_PARAMETER_NAME: SSM Parameter Store parameter holding a JSON object
+                           with application_name, deployment_group and
+                           sns_topic_arn (recommended)
+    CODEDEPLOY_APP_NAME:   Fallback CodeDeploy application name
+    CODEDEPLOY_DG_NAME:    Fallback CodeDeploy deployment group name
+    SNS_TOPIC_ARN:         Fallback SNS topic for operator notifications
+    AWS_REGION:            AWS Region (set automatically by Lambda)
 """
 
 from __future__ import annotations
@@ -38,7 +50,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import boto3
@@ -50,6 +62,8 @@ from botocore.exceptions import (
     EndpointConnectionError,
     ReadTimeoutError,
 )
+
+import mcp_server
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -76,9 +90,11 @@ MAX_REASON_LENGTH = 1000
 MAX_LIST_RESULTS = 25
 DEFAULT_LIST_RESULTS = 10
 BATCH_GET_LIMIT = 25
+# ListDeployments scan limits (newest deployments matter, old ones do not)
+MAX_SCANNED_DEPLOYMENTS = 100
+LOOKBACK_DAYS = 30
 NOTIFY_DECISIONS = ("hold", "escalate")
 ALLOWED_PARAMS = {
-    "action",
     "application_name",
     "deployment_group",
     "deployment_id",
@@ -86,8 +102,12 @@ ALLOWED_PARAMS = {
     "decision",
     "max_results",
 }
-
-DEFAULT_ROLLBACK_REASON = "Automated rollback triggered by AWS DevOps Agent"
+# Fields each action must receive (mirrored by each tool's inputSchema.required)
+REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
+    "rollback": ("deployment_id", "reason"),
+    "stop": ("deployment_id", "reason"),
+    "notify": ("decision", "reason"),
+}
 
 # Error codes that are worth retrying after a short wait
 TRANSIENT_ERROR_CODES = {
@@ -309,11 +329,11 @@ def _validate_params(action: str, params: dict[str, Any]) -> None:
         ):
             raise ValidationError(f"max_results must be an integer from 1 to {MAX_LIST_RESULTS}")
 
-    if action == "notify":
-        if "reason" not in params:
-            raise ValidationError("reason is required for notify")
-        if "decision" not in params:
-            raise ValidationError("decision is required for notify")
+    for field in REQUIRED_PARAMS.get(action, ()):
+        if field not in params:
+            raise ValidationError(
+                f"{field} is required for {action}", error_code="MissingParameter"
+            )
 
 
 def _resolve_target(params: dict[str, Any]) -> tuple[str, str]:
@@ -366,16 +386,32 @@ def _newest(infos: list[dict[str, Any]]) -> dict[str, Any] | None:
 def _get_deployment_infos(
     app_name: str, dg_name: str, statuses: list[str] | None = None
 ) -> list[dict[str, Any]]:
-    """List deployments for the group and return their details, newest first."""
-    kwargs: dict[str, Any] = {"applicationName": app_name, "deploymentGroupName": dg_name}
+    """List deployments for the group and return their details, newest first.
+
+    Pages through ListDeployments for deployments created in the last
+    LOOKBACK_DAYS days, stops after MAX_SCANNED_DEPLOYMENTS IDs, and fetches
+    details in batches of BATCH_GET_LIMIT.
+    """
+    kwargs: dict[str, Any] = {
+        "applicationName": app_name,
+        "deploymentGroupName": dg_name,
+        "createTimeRange": {"start": datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)},
+    }
     if statuses:
         kwargs["includeOnlyStatuses"] = statuses
-    deployment_ids = codedeploy_client.list_deployments(**kwargs).get("deployments", [])
-    if not deployment_ids:
-        return []
-    infos = codedeploy_client.batch_get_deployments(
-        deploymentIds=deployment_ids[:BATCH_GET_LIMIT]
-    ).get("deploymentsInfo", [])
+    deployment_ids: list[str] = []
+    for page in codedeploy_client.get_paginator("list_deployments").paginate(**kwargs):
+        deployment_ids.extend(page.get("deployments", []))
+        if len(deployment_ids) >= MAX_SCANNED_DEPLOYMENTS:
+            break
+    deployment_ids = deployment_ids[:MAX_SCANNED_DEPLOYMENTS]
+
+    infos: list[dict[str, Any]] = []
+    for start in range(0, len(deployment_ids), BATCH_GET_LIMIT):
+        batch = codedeploy_client.batch_get_deployments(
+            deploymentIds=deployment_ids[start : start + BATCH_GET_LIMIT]
+        )
+        infos.extend(batch.get("deploymentsInfo", []))
     # ListDeployments does not document an ordering, so sort explicitly
     return sorted(infos, key=lambda info: _format_time(info.get("createTime")), reverse=True)
 
@@ -407,15 +443,14 @@ def _find_target_deployment(
 
 
 def handle_rollback(params: dict[str, Any]) -> dict[str, Any]:
-    """Stop the active deployment and trigger automatic rollback.
+    """Stop the given active deployment and trigger rollback.
 
-    This is the primary action the AWS DevOps Agent invokes when it determines
-    a deployment is causing issues. We use StopDeployment with
-    autoRollbackEnabled=True so CodeDeploy reverts traffic to the
-    previous stable task set.
+    Runs when an operator approves the rollback_deployment call that AWS
+    DevOps Agent recommended. StopDeployment with autoRollbackEnabled=True
+    makes CodeDeploy reroute traffic to the previous stable task set.
     """
     app_name, dg_name = _resolve_target(params)
-    reason = params.get("reason", DEFAULT_ROLLBACK_REASON).strip()
+    reason = params["reason"].strip()
     deployment_id = params.get("deployment_id")
 
     try:
@@ -436,7 +471,7 @@ def handle_rollback(params: dict[str, Any]) -> dict[str, Any]:
         _publish_notification(
             subject=f"[FAILED] Rollback attempt for {app_name}",
             message=(
-                f"Automated rollback FAILED for deployment {deployment_id or 'unknown'}.\n"
+                f"Approved rollback FAILED for deployment {deployment_id or 'unknown'}.\n"
                 f"Error: {code} ({error_type}, retryable={retryable})\n"
                 f"Reason: {reason}\n\n"
                 "Manual intervention may be required."
@@ -454,7 +489,8 @@ def handle_rollback(params: dict[str, Any]) -> dict[str, Any]:
     _publish_notification(
         subject=f"[ROLLBACK] {app_name} deployment rolled back",
         message=(
-            f"Deployment {deployment_id} has been stopped and rollback initiated.\n\n"
+            "Rollback approved by an operator in AWS DevOps Agent and initiated "
+            f"for deployment {deployment_id}.\n\n"
             f"Application: {app_name}\n"
             f"Deployment Group: {dg_name}\n"
             f"Status: {status}\n"
@@ -479,10 +515,10 @@ def handle_rollback(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def handle_stop(params: dict[str, Any]) -> dict[str, Any]:
-    """Stop the active deployment WITHOUT rollback.
+    """Stop the given active deployment WITHOUT rollback.
 
-    Use this when an operator wants to halt a deployment but keep the
-    current (new) task set active, for example for investigation.
+    Runs when an operator approves stop_deployment because they want to halt
+    a deployment but keep the current (new) task set active.
     """
     app_name, dg_name = _resolve_target(params)
     deployment_id = params.get("deployment_id")
@@ -610,8 +646,10 @@ def handle_list(params: dict[str, Any]) -> dict[str, Any]:
 def handle_notify(params: dict[str, Any]) -> dict[str, Any]:
     """Publish a hold or escalate decision to operators. No CodeDeploy mutation.
 
-    The runbook directs the agent here when the evidence does not support a
-    rollback, so a human sees the reasoning behind the hold.
+    Runs when an operator approves notify_operators after the agent
+    recommended hold or escalate, so the team sees the reasoning by SNS. For
+    hold on an active deployment, the message also shows how to end the
+    rollback window early with continue-deployment.
     """
     app_name, dg_name = _resolve_target(params)
     decision = params["decision"]
@@ -638,6 +676,13 @@ def handle_notify(params: dict[str, Any]) -> dict[str, Any]:
     else:
         subject = f"[ESCALATE] {app_name} deployment needs human review"
         footer = "The agent could not reach a confident decision. Please review."
+
+    if decision == "hold" and deployment_id and status in ACTIVE_STATUSES:
+        footer += (
+            "\nTo keep this deployment and end the rollback window now, run: "
+            f"aws deploy continue-deployment --deployment-id {deployment_id} "
+            "--deployment-wait-type TERMINATION_WAIT"
+        )
 
     error_code = _publish_notification(
         subject=subject,
@@ -688,39 +733,18 @@ ACTION_HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
-def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """Lambda entry point — routes to the appropriate action handler.
+def run_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Validate params and run one action. Returns {"statusCode", "body"}.
 
-    Expected event schema (from AWS DevOps Agent MCP tool invocation), see
-    devops-agent/mcp-tool-definition.json:
-    {
-        "action": "rollback" | "stop" | "status" | "list" | "notify",
-        "application_name": "optional, must equal the configured application",
-        "deployment_group": "optional, must equal the configured group",
-        "deployment_id": "optional, d-XXXXXXXXX",
-        "reason": "why the action is being taken (required for notify)",
-        "decision": "hold" | "escalate" (notify only, required),
-        "max_results": 10
-    }
+    mcp_server maps each MCP tool to an action and calls this function.
+    params holds the tool arguments only (no "action" field), for example
+    {"deployment_id": "d-XXXXXXXXX", "reason": "..."} for rollback.
     """
-    # Support both direct invocation and API Gateway proxy format
-    if isinstance(event, dict) and isinstance(event.get("body"), str):
-        try:
-            params = json.loads(event["body"])
-        except json.JSONDecodeError:
-            return _error_response(
-                "unknown", "Invalid JSON in request body", "InvalidJson", "validation"
-            )
-    else:
-        params = event
-
+    action = action.lower().strip() if isinstance(action, str) else ""
     if not isinstance(params, dict):
         return _error_response(
-            "unknown", "Request must be a JSON object", "InvalidRequest", "validation"
+            action or "missing", "Arguments must be a JSON object", "InvalidRequest", "validation"
         )
-
-    raw_action = params.get("action")
-    action = raw_action.lower().strip() if isinstance(raw_action, str) else ""
     # Log the action and parameter names only, not their values
     logger.info("Received action=%s params=%s", action or "missing", sorted(params))
 
@@ -746,7 +770,16 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             params.get("deployment_id") if isinstance(params.get("deployment_id"), str) else None,
         )
     except Exception:
-        # Catch-all for unexpected errors — never let the Lambda crash silently.
+        # Catch-all for unexpected errors, so the function never crashes silently.
         # Full detail stays in the logs; the caller gets a generic message.
         logger.exception("Unhandled exception in action '%s'", action)
         return _error_response(action, "Internal error", "InternalError", "permanent")
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """Lambda entry point for the API Gateway MCP endpoint (POST /mcp).
+
+    mcp_server.handle_http_event parses the MCP JSON-RPC request, checks the
+    SigV4 caller identity, and calls run_action for tools/call.
+    """
+    return mcp_server.handle_http_event(event, run_action, _error_response)
